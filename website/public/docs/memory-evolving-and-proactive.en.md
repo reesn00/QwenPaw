@@ -245,13 +245,13 @@ You normally do not need this: Auto-Dream runs on a daily schedule by default.
 
 ### Settings relevant to this page
 
-These live under `running.reme_light_memory_config` in `agent.json`. For the complete configuration (directories, Embedding, Daily Paper, index maintenance, other backends) see [Long-Term Memory](./memory).
+These live under `running.reme_light_memory_config` in `agent.json`. For the complete configuration (directories, Embedding, Daily Paper, Auto Fin, index maintenance, and other backends) see [Long-Term Memory](./memory).
 
 | Field                               | Default        | Description                                                      |
 | ----------------------------------- | -------------- | ---------------------------------------------------------------- |
 | `dream_cron_enabled`                | `true`         | Enable scheduled Auto-Dream                                      |
 | `dream_cron`                        | `"0 23 * * *"` | Five-field cron; the run starts after a random 0–60 second delay |
-| `auto_dream_inbox_push_enabled`     | `true`         | Send successful or failed Auto-Dream summaries to Inbox          |
+| `auto_dream_inbox_push_enabled`     | `true`         | Send Auto-Dream changes and failures to Inbox                    |
 | `auto_memory_interval`              | `5`            | Run Auto-Memory after every N user turns                         |
 | `auto_memory_search_config.enabled` | `false`        | Search memory automatically before every normal user request     |
 
