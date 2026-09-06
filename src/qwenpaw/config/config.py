@@ -853,6 +853,39 @@ class ADBPGMemoryConfig(BaseModel):
     )
 
 
+class PowerContextMemoryConfig(BaseModel):
+    """PowerContext remote memory backend configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    base_url: str = Field(
+        default="",
+        description="PowerContext memory service base URL",
+    )
+    token: str = Field(
+        default="",
+        description="Bearer token for PowerContext authentication",
+    )
+    scope_id: str = Field(
+        default="",
+        description=(
+            "Optional scope ID for memory isolation. When empty, a "
+            "deterministic per-installation, per-agent scope is derived."
+        ),
+    )
+    timeout: float = Field(
+        default=10.0,
+        ge=0.1,
+        description="Request timeout in seconds for PowerContext calls",
+    )
+    auto_memory_search_config: AutoMemorySearchConfig = Field(
+        default_factory=lambda: AutoMemorySearchConfig(
+            enabled=True,
+            max_results=3,
+        ),
+    )
+
+
 class ReMeLightMemoryConfig(BaseModel):
     """ReMeLight memory manager configuration."""
 
@@ -1729,52 +1762,6 @@ def _sanitize_loop_config(
     running["loop"] = validated.model_dump(exclude_none=True)
 
 
-class TranscriptExportConfig(BaseModel):
-    """Append-only conversation transcript export (JSONL).
-
-    When enabled, each completed agent response appends newly observed
-    messages for the session to a local JSONL file. Disabled by default so
-    the main request path performs no extra disk I/O.
-    """
-
-    model_config = ConfigDict(extra="ignore")
-
-    enabled: bool = Field(
-        default=False,
-        description=(
-            "Append per-turn transcript JSONL after each response. "
-            "Off by default; no transcript disk I/O when disabled."
-        ),
-    )
-    path: str = Field(
-        default="transcripts",
-        description=(
-            "Directory relative to the agent workspace_dir where per-session "
-            "JSONL files are written."
-        ),
-    )
-    include_reasoning: bool = Field(
-        default=True,
-        description="Include model thinking / reasoning blocks.",
-    )
-    include_tool_calls: bool = Field(
-        default=True,
-        description="Include tool / plugin call messages.",
-    )
-    include_tool_results: bool = Field(
-        default=True,
-        description="Include tool / plugin call output messages.",
-    )
-    max_tool_output_chars: int = Field(
-        default=50_000,
-        ge=0,
-        description=(
-            "Truncate tool output strings longer than this many characters. "
-            "0 means no truncation."
-        ),
-    )
-
-
 class AgentsRunningConfig(BaseModel):
     """Agent runtime behavior configuration."""
 
@@ -1929,20 +1916,18 @@ class AgentsRunningConfig(BaseModel):
         ),
     )
 
-    transcript_export: TranscriptExportConfig = Field(
-        default_factory=TranscriptExportConfig,
-        description=(
-            "Optional append-only JSONL transcript export after each "
-            "response. See TranscriptExportConfig."
-        ),
-    )
-
     memory_manager_backend: str = Field(default="remelight")
 
     adbpg_memory_config: Optional[ADBPGMemoryConfig] = Field(
         default=None,
         description="ADBPG memory configuration (used when "
         "memory_manager_backend='adbpg')",
+    )
+
+    powercontext_memory_config: Optional[PowerContextMemoryConfig] = Field(
+        default=None,
+        description="PowerContext memory configuration (used when "
+        "memory_manager_backend='powercontext')",
     )
 
     reme_light_memory_config: ReMeLightMemoryConfig = Field(
