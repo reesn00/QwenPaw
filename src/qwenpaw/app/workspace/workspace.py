@@ -35,37 +35,15 @@ from ..chats.session import SafeJSONSession
 from ..crons.manager import CronManager
 from ..crons.repo.json_repo import JsonJobRepository
 from ...config.config import load_agent_config
+from ...trajectory.service import (
+    build_trajectory_config,
+    register_trajectory_service,
+    TrajectoryService,
+    unregister_trajectory_service,
+)
 from ...utils.logging import sanitize_log_value
 
 logger = logging.getLogger(__name__)
-
-
-def _memory_manager_reuse_compatible(
-    workspace: "Workspace",
-    instance: Any,
-) -> bool:
-    """Keep a memory service only when its backend configuration is unchanged.
-
-    Reused services do not receive ``start()`` on workspace reload.  Remote
-    backends therefore must be recreated when their endpoint, credentials,
-    scope, timeout, or search settings change; otherwise the old HTTP client
-    would continue serving the new workspace configuration.
-    """
-    from ...agents.memory.powercontext_memory_manager import (
-        PowerContextMemoryManager,
-    )
-
-    if not isinstance(instance, PowerContextMemoryManager):
-        return True
-    old_config = getattr(instance, "_config", None)
-    new_running = getattr(getattr(workspace, "_config", None), "running", None)
-    new_config = getattr(new_running, "powercontext_memory_config", None)
-    if old_config is None or new_config is None:
-        return old_config is new_config
-    try:
-        return old_config.model_dump() == new_config.model_dump()
-    except AttributeError:
-        return old_config == new_config
 
 
 class Workspace:
@@ -450,7 +428,6 @@ class Workspace:
                 start_method="start",
                 stop_method="close",
                 reusable=True,
-                reuse_compatibility=_memory_manager_reuse_compatible,
                 priority=20,
                 concurrent_init=True,
                 # reme depends on `agentscope.token`, which agentscope no
@@ -480,6 +457,22 @@ class Workspace:
                 reusable=True,
                 priority=20,
                 concurrent_init=True,
+            ),
+        )
+
+        sm.register(
+            ServiceDescriptor(
+                name="trajectory",
+                service_class=TrajectoryService,
+                init_args=lambda ws: {
+                    "workspace_dir": ws.workspace_dir,
+                    "config": build_trajectory_config(ws.config),
+                },
+                start_method="start",
+                stop_method="stop",
+                priority=20,
+                concurrent_init=True,
+                optional=True,
             ),
         )
 
@@ -635,6 +628,12 @@ class Workspace:
             # 3. Start all services via ServiceManager
             await self._service_manager.start_all()
 
+            # 4. Register trajectory service globally so integration points
+            # can locate it by agent_id without holding a Workspace reference.
+            trajectory_service = self._service_manager.services.get("trajectory")
+            if trajectory_service is not None:
+                register_trajectory_service(self.agent_id, trajectory_service)
+
             self._started = True
             logger.info(
                 "Workspace started successfully: "
@@ -754,6 +753,8 @@ class Workspace:
             final=final,
             preserve_reused=preserve_reused,
         )
+
+        unregister_trajectory_service(self.agent_id)
 
         if self._harness_runtime is not None:
             await self._harness_runtime.stop()

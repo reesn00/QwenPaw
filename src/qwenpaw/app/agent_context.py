@@ -35,6 +35,12 @@ _current_root_session_id: ContextVar[Optional[str]] = ContextVar(
     default=None,
 )
 
+# Context variable to store the current request trace id for trajectory logging
+_current_trace_id: ContextVar[Optional[str]] = ContextVar(
+    "current_trace_id",
+    default=None,
+)
+
 _current_user_id: ContextVar[Optional[str]] = ContextVar(
     "current_user_id",
     default=None,
@@ -363,6 +369,24 @@ def get_current_root_session_id() -> Optional[str]:
         Root session ID or None
     """
     return _current_root_session_id.get()
+
+
+def set_current_trace_id(trace_id: Optional[str]):
+    """Set current request trace ID in context.
+
+    Returns the context-var token so callers can reset it if needed.
+    """
+    return _current_trace_id.set(trace_id)
+
+
+def reset_current_trace_id(token) -> None:
+    """Reset current request trace ID to its previous value."""
+    _current_trace_id.reset(token)
+
+
+def get_current_trace_id() -> Optional[str]:
+    """Get current request trace ID from context."""
+    return _current_trace_id.get()
 
 
 def set_current_user_id(user_id: Optional[str]) -> None:

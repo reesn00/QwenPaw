@@ -231,6 +231,38 @@ TOKEN_USAGE_FILE = EnvVarLoader.get_str(
     "token_usage.json",
 )
 
+TRAJECTORY_FILE = EnvVarLoader.get_str(
+    "QWENPAW_TRAJECTORY_FILE",
+    "trajectory.jsonl",
+)
+# Subdirectory under each workspace that holds one JSONL file per session.
+# The legacy single-file layout (``<workspace>/trajectory.jsonl``) is no
+# longer produced — events are partitioned by ``session_id`` so a single
+# agent's history can be inspected one conversation at a time.
+TRAJECTORY_DIR = EnvVarLoader.get_str(
+    "QWENPAW_TRAJECTORY_DIR",
+    "trajectory",
+)
+TRAJECTORY_ENABLED = EnvVarLoader.get_bool(
+    "QWENPAW_TRAJECTORY_ENABLED",
+    default=True,
+)
+TRAJECTORY_MAX_RECORD_BYTES = EnvVarLoader.get_int(
+    "QWENPAW_TRAJECTORY_MAX_RECORD_BYTES",
+    default=256 * 1024,
+    min_value=0,
+)
+TRAJECTORY_RETENTION_DAYS = EnvVarLoader.get_int(
+    "QWENPAW_TRAJECTORY_RETENTION_DAYS",
+    default=30,
+    min_value=0,
+)
+TRAJECTORY_FLUSH_INTERVAL_SECONDS = EnvVarLoader.get_int(
+    "QWENPAW_TRAJECTORY_FLUSH_INTERVAL",
+    default=10,
+    min_value=1,
+)
+
 CONFIG_FILE = EnvVarLoader.get_str("QWENPAW_CONFIG_FILE", "config.json")
 
 HEARTBEAT_FILE = EnvVarLoader.get_str("QWENPAW_HEARTBEAT_FILE", "HEARTBEAT.md")

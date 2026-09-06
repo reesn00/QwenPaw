@@ -26,6 +26,75 @@ from ._timeout_helper import (
 
 logger = logging.getLogger(__name__)
 
+
+def _record_tool_execution(entry: ToolCallEntry) -> None:
+    """Best-effort trajectory recording for a finalized tool call."""
+    try:
+        from ..trajectory import (
+            get_trajectory_service,
+            TrajectoryEventType,
+        )
+        from ..app.agent_context import (
+            get_current_trace_id,
+            get_current_user_id,
+            get_current_channel,
+        )
+
+        ctx = entry.ctx
+        service = get_trajectory_service(ctx.agent_id)
+        if service is None:
+            return
+        recorder = service.recorder
+        if not recorder.enabled:
+            return
+
+        response = entry.final_response
+        output_text = ""
+        if response is not None:
+            content = getattr(response, "content", None)
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    text = getattr(block, "text", None) or (
+                        block.get("text") if isinstance(block, dict) else None
+                    )
+                    if text:
+                        parts.append(str(text))
+                output_text = "\n".join(parts)
+            else:
+                output_text = str(content)
+
+        duration_ms = int(
+            (time.monotonic() - ctx.started_at) * 1000,
+        ) if ctx.started_at else 0
+
+        recorder.record(
+            trace_id=get_current_trace_id() or ctx.session_id,
+            event_type=TrajectoryEventType.TOOL_EXECUTION,
+            payload={
+                "tool_call_id": ctx.tool_call_id,
+                "tool_name": ctx.tool_name,
+                "input": ctx.tool_input,
+                "output": output_text,
+            },
+            metadata={
+                "duration_ms": duration_ms,
+                "end_state": entry.end_state,
+                "offload_reason": (
+                    ctx.offload_reason.value if ctx.offload_reason else None
+                ),
+                "cancel_reason": (
+                    ctx.cancel_reason.value if ctx.cancel_reason else None
+                ),
+            },
+            session_id=ctx.session_id,
+            agent_id=ctx.agent_id,
+            user_id=get_current_user_id() or "",
+            channel=get_current_channel() or "",
+        )
+    except Exception:
+        logger.debug("trajectory: failed to record tool execution", exc_info=True)
+
 # Keep finalized entries briefly so GET /output after SSE ``done`` can still
 # read ``final_response`` (finalize pops from the hot table immediately).
 _COMPLETED_CACHE_TTL_SECS = 60.0
@@ -253,6 +322,7 @@ class ToolCoordinator:
             started_at=now,
             offload_deadline=offload_deadline,
             cancel_event=asyncio.Event(),
+            tool_input=_parse_tool_input(tool_call) or None,
         )
         return ToolCallEntry(
             ctx=ctx,
@@ -940,6 +1010,7 @@ class ToolCoordinator:
             entry.end_state = (
                 "interrupted" if entry.ctx.cancel_event.is_set() else "success"
             )
+        _record_tool_execution(entry)
         self._entries.pop(entry.ctx.tool_call_id, None)
         self._store_completed(entry)
         return entry.final_response

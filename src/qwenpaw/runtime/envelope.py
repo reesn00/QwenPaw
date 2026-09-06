@@ -26,6 +26,64 @@ def _gen_msg_id() -> str:
     return "msg_" + uuid.uuid4().hex
 
 
+def _record_final_reply(
+    response: Any,
+    status: str,
+    error: dict[str, Any] | None,
+) -> None:
+    """Best-effort trajectory recording for the final assistant reply."""
+    try:
+        from ..app.agent_context import (
+            get_current_agent_id,
+            get_current_channel,
+            get_current_session_id,
+            get_current_trace_id,
+            get_current_user_id,
+        )
+        from ..trajectory import get_trajectory_service, TrajectoryEventType
+
+        agent_id = get_current_agent_id() or ""
+        service = get_trajectory_service(agent_id)
+        if service is None:
+            return
+        recorder = service.recorder
+        if not recorder.enabled:
+            return
+
+        output = getattr(response, "output", [])
+        content: list[dict[str, Any]] = []
+        if isinstance(output, list):
+            for item in output:
+                try:
+                    content.append(
+                        item.model_dump(mode="json")
+                        if hasattr(item, "model_dump")
+                        else dict(item),
+                    )
+                except Exception:
+                    content.append(str(item))
+
+        metadata: dict[str, Any] = {"status": status}
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            metadata["usage"] = usage
+        if error is not None:
+            metadata["error"] = error
+
+        recorder.record(
+            trace_id=get_current_trace_id() or "",
+            event_type=TrajectoryEventType.FINAL_REPLY,
+            payload={"content": content},
+            metadata=metadata,
+            session_id=get_current_session_id() or "",
+            agent_id=agent_id,
+            user_id=get_current_user_id() or "",
+            channel=get_current_channel() or "",
+        )
+    except Exception:
+        logger.debug("trajectory: failed to record final reply", exc_info=True)
+
+
 @dataclass(frozen=True)
 class _EventMetadataExcludedOutput:
     """An output that must not inherit metadata from the current event."""
@@ -890,6 +948,14 @@ class Envelope:
             self._response.status = RunStatus.Completed
         self._response.completed_at = datetime.now(timezone.utc).isoformat(
             timespec="seconds",
+        )
+        status_str = (
+            "failed" if self._response.status == RunStatus.Failed else "completed"
+        )
+        _record_final_reply(
+            self._response,
+            status=status_str,
+            error=getattr(self._response, "error", None),
         )
         yield self._tag_seq(self._response)
         self._finalized = True

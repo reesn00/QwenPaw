@@ -56,8 +56,20 @@ class Runtime:
         ctx = self._build_context(request)
         hooks = self.workspace.plugins.hook_registry
 
+        from ..app.agent_context import (
+            reset_current_trace_id,
+            set_current_trace_id,
+        )
+
         envelope = Envelope(session_id=ctx.session_id)
         ctx._envelope = envelope  # pylint: disable=protected-access
+        trace_id = envelope.response.id if envelope.response else None
+        trace_token = set_current_trace_id(trace_id) if trace_id else None
+        # NOTE: TURN_START recording is deferred until after AgentBuilder.build
+        # so the trajectory can persist provider_id / model_name / backend
+        # alongside the request context. Early hook short-circuits and build
+        # failures skip the event — slash-command replies and ERROR events
+        # already cover those cases.
         skip_agent = False
 
         try:
@@ -104,6 +116,11 @@ class Runtime:
                     app_services=self.app_services,
                 )
                 ctx.agent = await builder.build(ctx)
+                # Record turn_start now that the model is resolved; the
+                # trajectory benefits from provider_id / model_name / backend
+                # which are only knowable after the build (model_slot_override
+                # and active-model fallback happen there).
+                self._record_turn_start(ctx, request, trace_id)
                 await self._start_modes(ctx)
 
                 # --- [phase 4] POST_AGENT_BUILD ---
@@ -143,6 +160,7 @@ class Runtime:
 
         except (asyncio.CancelledError, KeyboardInterrupt) as e:
             ctx.error = e
+            self._record_cancel(ctx, trace_id, e)
             # The Task's _must_cancel flag may still be True after
             # catching CancelledError, causing the next await to raise
             # CancelledError again.  Wrap ON_ERROR hooks so that
@@ -167,6 +185,12 @@ class Runtime:
             raise
         except ConfigurationException as e:
             ctx.error = e
+            self._record_error(
+                ctx,
+                trace_id,
+                e,
+                error_code=e.error_code or "CONFIGURATION_REQUIRED",
+            )
             logger.info(
                 "runtime: configuration required session=%s code=%s",
                 getattr(ctx, "session_id", ""),
@@ -182,13 +206,6 @@ class Runtime:
             await self._try_save_on_cancel(ctx)
 
             ctx.error = e
-            logger.error(
-                "runtime: unhandled error session=%s: %s",
-                getattr(ctx, "session_id", ""),
-                e,
-                exc_info=True,
-            )
-            await hooks.run(Phase.ON_ERROR, ctx)
             err_text = ctx.extras.get(
                 "_error_text",
                 str(e) or e.__class__.__name__,
@@ -197,6 +214,14 @@ class Runtime:
                 "_error_code",
                 e.__class__.__name__,
             )
+            self._record_error(ctx, trace_id, e, error_code=err_code)
+            logger.error(
+                "runtime: unhandled error session=%s: %s",
+                getattr(ctx, "session_id", ""),
+                e,
+                exc_info=True,
+            )
+            await hooks.run(Phase.ON_ERROR, ctx)
             async for ev in envelope.error_envelope(
                 err_text,
                 err_code,
@@ -204,6 +229,11 @@ class Runtime:
                 yield ev
             raise
         finally:
+            if trace_token is not None:
+                try:
+                    reset_current_trace_id(trace_token)
+                except Exception:
+                    pass
             # Close agent first so governor can flush audit log and persist
             # policy before downstream FINALLY hooks observe the context.
             # See ``QwenPawAgent.close`` (agents/react_agent.py).
@@ -220,6 +250,201 @@ class Runtime:
             await hooks.run(Phase.FINALLY, ctx)
 
     # ----------------------------------------------------------------- helpers
+
+    def _record_turn_start(
+        self,
+        ctx: HookContext,
+        request: Any,
+        trace_id: str | None,
+    ) -> None:
+        """Best-effort trajectory recording for the start of a turn."""
+        if not trace_id:
+            return
+        try:
+            from ..trajectory import (
+                get_trajectory_service,
+                TrajectoryEventType,
+            )
+
+            service = get_trajectory_service(ctx.agent_id)
+            if service is None:
+                return
+            recorder = service.recorder
+            if not recorder.enabled:
+                return
+            user_id = getattr(request, "user_id", "") or ctx.session_id
+            channel = getattr(request, "channel", "") or ""
+
+            # Pull provider/model/agent_backend from the freshly built agent
+            # so the trajectory can be joined against MODEL_REQUEST events
+            # without depending on request-only fields. Falls back to the
+            # ``active_model`` on the loaded agent config when the model
+            # wrapper does not expose provider metadata.
+            provider_id, model_name = self._resolve_turn_model(ctx)
+            agent_backend = self._resolve_turn_backend(ctx)
+
+            recorder.record(
+                trace_id=trace_id,
+                event_type=TrajectoryEventType.TURN_START,
+                payload={
+                    "input_text": _get_last_user_text(ctx.input_msgs) or "",
+                    "request_agent_id": getattr(request, "agent_id", None),
+                    "agent_backend": agent_backend,
+                },
+                session_id=ctx.session_id,
+                agent_id=ctx.agent_id,
+                user_id=user_id,
+                channel=channel,
+                provider_id=provider_id,
+                model_name=model_name,
+            )
+        except Exception:
+            logger.debug("trajectory: failed to record turn_start", exc_info=True)
+
+    @staticmethod
+    def _resolve_turn_model(ctx: HookContext) -> tuple[str, str]:
+        """Best-effort extraction of provider_id / model_name for TURN_START.
+
+        Walks the typical wrapper chain (``_inner`` / ``_model``) used by
+        AgentScope providers so a recording wrapper like
+        ``TokenRecordingModelWrapper`` does not shadow the real provider id.
+        Falls back to ``ctx.agent_config.active_model`` when the live
+        model does not expose ``_provider_id`` (custom adapters), and to
+        empty strings when nothing is known — never raises.
+        """
+        agent = getattr(ctx, "agent", None)
+        model = getattr(agent, "model", None) if agent is not None else None
+        if model is not None:
+            inner = model
+            # Unwrap common transparent wrappers so the provider/model on the
+            # concrete adapter (anthropic / openai / dashscope / ...) wins.
+            for _ in range(4):
+                # ``hasattr`` returns True for ``SimpleNamespace`` even when
+                # the attribute is missing (it returns ``None`` instead of
+                # raising). Check both presence AND a non-empty value so the
+                # fallback path engages for plain namespace test doubles.
+                provider_id = getattr(inner, "_provider_id", None)
+                model_name = getattr(inner, "model", None)
+                if provider_id is not None or model_name is not None:
+                    return (
+                        str(provider_id or ""),
+                        str(model_name or ""),
+                    )
+                next_inner = getattr(inner, "_inner", None) or getattr(
+                    inner,
+                    "_model",
+                    None,
+                )
+                if next_inner is None or next_inner is inner:
+                    break
+                inner = next_inner
+            model_str = getattr(model, "model", None)
+            if model_str:
+                return "", str(model_str)
+        agent_config = getattr(ctx, "agent_config", None)
+        active = getattr(agent_config, "active_model", None) if agent_config else None
+        if active is not None:
+            return (
+                str(getattr(active, "provider_id", "") or ""),
+                str(getattr(active, "model", "") or ""),
+            )
+        return ("", "")
+
+    @staticmethod
+    def _resolve_turn_backend(ctx: HookContext) -> str:
+        """Return the runtime backend name for the current workspace.
+
+        Reads from ``ctx.workspace.config.backend`` (always populated) so the
+        trajectory can distinguish native ``qwenpaw`` runs from third-party
+        ACP / harness backends.
+        """
+        workspace = getattr(ctx, "workspace", None)
+        config = getattr(workspace, "config", None) if workspace else None
+        if config is not None:
+            backend = getattr(config, "backend", None)
+            if isinstance(backend, str) and backend:
+                return backend
+        return ""
+
+    def _record_error(
+        self,
+        ctx: HookContext,
+        trace_id: str | None,
+        error: BaseException,
+        error_code: str | None = None,
+    ) -> None:
+        """Best-effort trajectory recording for an unhandled error."""
+        if not trace_id:
+            return
+        try:
+            from ..trajectory import (
+                get_trajectory_service,
+                TrajectoryEventType,
+            )
+
+            service = get_trajectory_service(ctx.agent_id)
+            if service is None:
+                return
+            recorder = service.recorder
+            if not recorder.enabled:
+                return
+            request = ctx.request
+            user_id = getattr(request, "user_id", "") or ctx.session_id
+            channel = getattr(request, "channel", "") or ""
+            recorder.record(
+                trace_id=trace_id,
+                event_type=TrajectoryEventType.ERROR,
+                payload={
+                    "error_code": error_code or error.__class__.__name__,
+                    "error_message": str(error) or error.__class__.__name__,
+                },
+                metadata={"exception_type": error.__class__.__name__},
+                session_id=ctx.session_id,
+                agent_id=ctx.agent_id,
+                user_id=user_id,
+                channel=channel,
+            )
+        except Exception:
+            logger.debug("trajectory: failed to record error", exc_info=True)
+
+    def _record_cancel(
+        self,
+        ctx: HookContext,
+        trace_id: str | None,
+        error: BaseException,
+    ) -> None:
+        """Best-effort trajectory recording for a cancelled turn."""
+        if not trace_id:
+            return
+        try:
+            from ..trajectory import (
+                get_trajectory_service,
+                TrajectoryEventType,
+            )
+
+            service = get_trajectory_service(ctx.agent_id)
+            if service is None:
+                return
+            recorder = service.recorder
+            if not recorder.enabled:
+                return
+            request = ctx.request
+            user_id = getattr(request, "user_id", "") or ctx.session_id
+            channel = getattr(request, "channel", "") or ""
+            recorder.record(
+                trace_id=trace_id,
+                event_type=TrajectoryEventType.CANCEL,
+                payload={
+                    "cancel_type": error.__class__.__name__,
+                    "message": str(error) or error.__class__.__name__,
+                },
+                session_id=ctx.session_id,
+                agent_id=ctx.agent_id,
+                user_id=user_id,
+                channel=channel,
+            )
+        except Exception:
+            logger.debug("trajectory: failed to record cancel", exc_info=True)
 
     async def _start_modes(self, ctx: HookContext) -> None:
         """Prepare every registered mode for the current user turn."""

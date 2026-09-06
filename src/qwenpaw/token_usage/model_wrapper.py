@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Model wrapper that records token usage from LLM responses."""
 
+import time
 from datetime import date, datetime, timezone
 from typing import Any, AsyncGenerator, Literal
 
@@ -11,6 +12,175 @@ from agentscope.model._model_usage import ChatUsage
 from ..utils.model_response import safe_attr
 from .buffer import _UsageEvent
 from .manager import _usage_agent_id, get_token_usage_manager
+
+
+def _get_trajectory_recorder() -> Any | None:
+    """Return the active trajectory recorder for the current agent, if any."""
+    try:
+        from ..app.agent_context import get_current_agent_id
+        from ..trajectory import get_trajectory_service
+
+        service = get_trajectory_service(get_current_agent_id())
+        if service is not None:
+            return service.recorder
+    except Exception:
+        pass
+    return None
+
+
+def _request_payload(
+    messages: list[dict],
+    tools: list[dict] | None,
+    tool_choice: Any,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a serializable request payload."""
+    payload: dict[str, Any] = {"messages": messages}
+    if tools is not None:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    if kwargs:
+        payload["kwargs"] = kwargs
+    return payload
+
+
+# Fields commonly accepted by AgentScope ``generate_structured_output``. We
+# surface them at the top level of MODEL_REQUEST so trajectory consumers see
+# the same shape as the ``__call__`` path; anything else drops into
+# ``extra_kwargs`` / ``args`` for completeness without leaking the entire raw
+# ``*args, **kwargs`` blob.
+_STRUCTURED_OUTPUT_KNOWN_KWARGS = frozenset(
+    {
+        "messages",
+        "tools",
+        "tool_choice",
+        "response_schema",
+        "structured_model",
+    },
+)
+
+
+def _structured_output_payload(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Best-effort normalization of ``generate_structured_output`` arguments.
+
+    AgentScope providers pass ``messages`` either as the first positional
+    arg or as the ``messages`` kwarg; ``tools`` / ``tool_choice`` may
+    also appear when the schema-aware call goes through the same code path.
+    ``response_schema`` is dropped from the residual bag and serialized via
+    ``model_json_schema()`` when available so the trajectory stays small.
+    """
+    payload: dict[str, Any] = {}
+    messages = kwargs.get("messages")
+    if messages is None and args and isinstance(args[0], list):
+        messages = args[0]
+    if messages is not None:
+        payload["messages"] = messages
+
+    if kwargs.get("tools") is not None:
+        payload["tools"] = kwargs["tools"]
+    if kwargs.get("tool_choice") is not None:
+        payload["tool_choice"] = kwargs["tool_choice"]
+
+    schema = kwargs.get("response_schema")
+    if schema is not None:
+        try:
+            payload["response_schema"] = schema.model_json_schema()
+        except Exception:
+            try:
+                payload["response_schema"] = str(schema)
+            except Exception:
+                pass
+
+    extra_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in _STRUCTURED_OUTPUT_KNOWN_KWARGS
+    }
+    if extra_kwargs:
+        payload["extra_kwargs"] = extra_kwargs
+
+    # Surface any positional args we did not consume so the blob stays
+    # round-trippable; skip the leading messages positional when we already
+    # promoted it above.
+    leftover_args: list[Any] = []
+    if messages is not None and args and isinstance(args[0], list):
+        leftover_args.extend(args[1:])
+    else:
+        leftover_args.extend(args)
+    if leftover_args:
+        payload["args"] = leftover_args
+
+    return payload
+
+
+def _response_payload(response: Any) -> dict[str, Any]:
+    """Build a serializable response payload."""
+    payload: dict[str, Any] = {}
+    text = safe_attr(response, "text")
+    if text is not None:
+        payload["text"] = text
+    tool_calls = safe_attr(response, "tool_calls")
+    if tool_calls is not None:
+        payload["tool_calls"] = tool_calls
+    usage = safe_attr(response, "usage")
+    if usage is not None:
+        try:
+            payload["usage"] = usage.model_dump(mode="json")
+        except Exception:
+            try:
+                payload["usage"] = dict(usage)
+            except Exception:
+                payload["usage"] = str(usage)
+    finish_reason = safe_attr(response, "finish_reason")
+    if finish_reason is not None:
+        payload["finish_reason"] = finish_reason
+    return payload
+
+
+def _extract_thinking(response: Any) -> str | None:
+    """Extract reasoning/thinking content from a response object."""
+    reasoning = safe_attr(response, "reasoning_content")
+    if reasoning:
+        return str(reasoning)
+    # Some adapters place thinking in extra_content or text.
+    extra = safe_attr(response, "extra_content")
+    if isinstance(extra, dict):
+        reasoning = extra.get("reasoning_content") or extra.get("thinking")
+        if reasoning:
+            return str(reasoning)
+    return None
+
+
+def _trajectory_context() -> dict[str, Any]:
+    """Collect context vars for a trajectory event."""
+    try:
+        from ..app.agent_context import (
+            get_current_agent_id,
+            get_current_channel,
+            get_current_session_id,
+            get_current_trace_id,
+            get_current_user_id,
+        )
+
+        return {
+            "trace_id": get_current_trace_id() or "",
+            "session_id": get_current_session_id() or "",
+            "agent_id": get_current_agent_id() or "",
+            "user_id": get_current_user_id() or "",
+            "channel": get_current_channel() or "",
+        }
+    except Exception:
+        return {
+            "trace_id": "",
+            "session_id": "",
+            "agent_id": "",
+            "user_id": "",
+            "channel": "",
+        }
 
 # AgentScope does not expose provider cache semantics through a public
 # capability API. These prefixes therefore depend on its concrete adapter MRO
@@ -222,8 +392,37 @@ class TokenRecordingModelWrapper(ChatModelBase):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        recorder = _get_trajectory_recorder()
+        request_span_id: str | None = None
+        started_at = time.monotonic()
+        if recorder is not None:
+            from ..trajectory.models import TrajectoryEventType
+
+            ctx = _trajectory_context()
+            event = recorder.record(
+                trace_id=ctx["trace_id"],
+                event_type=TrajectoryEventType.MODEL_REQUEST,
+                payload=_structured_output_payload(args, kwargs),
+                session_id=ctx["session_id"],
+                agent_id=ctx["agent_id"],
+                user_id=ctx["user_id"],
+                channel=ctx["channel"],
+                provider_id=self._provider_id,
+                model_name=self.model,
+            )
+            request_span_id = event.span_id if event is not None else None
+
         result = await self._model.generate_structured_output(*args, **kwargs)
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
         self._record_usage(safe_attr(result, "usage"))
+        if recorder is not None:
+            self._record_model_response(
+                recorder,
+                result,
+                request_span_id,
+                duration_ms,
+            )
         return result
 
     async def __call__(
@@ -247,6 +446,26 @@ class TokenRecordingModelWrapper(ChatModelBase):
         if tool_choice == "auto":
             tool_choice = None
 
+        recorder = _get_trajectory_recorder()
+        request_span_id: str | None = None
+        started_at = time.monotonic()
+        if recorder is not None:
+            from ..trajectory.models import TrajectoryEventType
+
+            ctx = _trajectory_context()
+            event = recorder.record(
+                trace_id=ctx["trace_id"],
+                event_type=TrajectoryEventType.MODEL_REQUEST,
+                payload=_request_payload(messages, tools, tool_choice, kwargs),
+                session_id=ctx["session_id"],
+                agent_id=ctx["agent_id"],
+                user_id=ctx["user_id"],
+                channel=ctx["channel"],
+                provider_id=self._provider_id,
+                model_name=self.model,
+            )
+            request_span_id = event.span_id if event is not None else None
+
         result = await self._model(
             messages=messages,
             tools=tools,
@@ -254,22 +473,132 @@ class TokenRecordingModelWrapper(ChatModelBase):
             **kwargs,
         )
 
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+
         if isinstance(result, AsyncGenerator):
-            return self._wrap_stream(result)
+            return self._wrap_stream(result, request_span_id, duration_ms)
+
         self._record_usage(safe_attr(result, "usage"))
+        if recorder is not None:
+            self._record_model_response(
+                recorder,
+                result,
+                request_span_id,
+                duration_ms,
+            )
         return result
+
+    def _record_model_response(
+        self,
+        recorder: Any,
+        response: Any,
+        parent_span_id: str | None,
+        duration_ms: int,
+    ) -> None:
+        """Record model_response, tool_call_request and optional thinking event."""
+        from ..trajectory.models import TrajectoryEventType
+
+        ctx = _trajectory_context()
+        response_event = recorder.record(
+            trace_id=ctx["trace_id"],
+            event_type=TrajectoryEventType.MODEL_RESPONSE,
+            parent_span_id=parent_span_id,
+            payload=_response_payload(response),
+            metadata={"duration_ms": duration_ms},
+            session_id=ctx["session_id"],
+            agent_id=ctx["agent_id"],
+            user_id=ctx["user_id"],
+            channel=ctx["channel"],
+            provider_id=self._provider_id,
+            model_name=self.model,
+        )
+        tool_calls = safe_attr(response, "tool_calls")
+        if tool_calls:
+            recorder.record(
+                trace_id=ctx["trace_id"],
+                event_type=TrajectoryEventType.TOOL_CALL_REQUEST,
+                parent_span_id=response_event.span_id if response_event else None,
+                payload={"tool_calls": tool_calls},
+                session_id=ctx["session_id"],
+                agent_id=ctx["agent_id"],
+                user_id=ctx["user_id"],
+                channel=ctx["channel"],
+                provider_id=self._provider_id,
+                model_name=self.model,
+            )
+        thinking = _extract_thinking(response)
+        if thinking:
+            recorder.record(
+                trace_id=ctx["trace_id"],
+                event_type=TrajectoryEventType.THINKING,
+                parent_span_id=response_event.span_id if response_event else None,
+                payload={"thinking": thinking},
+                session_id=ctx["session_id"],
+                agent_id=ctx["agent_id"],
+                user_id=ctx["user_id"],
+                channel=ctx["channel"],
+                provider_id=self._provider_id,
+                model_name=self.model,
+            )
 
     async def _wrap_stream(
         self,
         stream: AsyncGenerator[ChatResponse, None],
+        request_span_id: str | None = None,
+        request_duration_ms: int = 0,
     ) -> AsyncGenerator[ChatResponse, None]:
         last_usage: ChatUsage | None = None
+        text_chunks: list[str] = []
+        reasoning_chunks: list[str] = []
+        tool_calls_seen: list[Any] = []
+        recorder = _get_trajectory_recorder()
         try:
             async for chunk in stream:
                 usage = safe_attr(chunk, "usage")
                 if usage is not None:
                     last_usage = usage
+                text = safe_attr(chunk, "text")
+                if text:
+                    text_chunks.append(str(text))
+                reasoning = _extract_thinking(chunk)
+                if reasoning:
+                    reasoning_chunks.append(reasoning)
+                tc = safe_attr(chunk, "tool_calls")
+                if tc:
+                    tool_calls_seen.extend(tc)
                 yield chunk
         finally:
             await stream.aclose()
             self._record_usage(last_usage)
+            if recorder is not None:
+                ctx = _trajectory_context()
+                # Reconstruct a minimal response object for payload extraction.
+                pseudo_response: Any = type("PseudoResponse", (), {})()
+                if text_chunks:
+                    pseudo_response.text = "".join(text_chunks)
+                if tool_calls_seen:
+                    pseudo_response.tool_calls = tool_calls_seen
+                if last_usage is not None:
+                    pseudo_response.usage = last_usage
+                self._record_model_response(
+                    recorder,
+                    pseudo_response,
+                    request_span_id,
+                    request_duration_ms,
+                )
+                if reasoning_chunks:
+                    from ..trajectory.models import TrajectoryEventType
+
+                    thinking_text = "\n".join(reasoning_chunks)
+                    recorder.record(
+                        trace_id=ctx["trace_id"],
+                        event_type=TrajectoryEventType.THINKING,
+                        parent_span_id=request_span_id,
+                        payload={"thinking": thinking_text},
+                        session_id=ctx["session_id"],
+                        agent_id=ctx["agent_id"],
+                        user_id=ctx["user_id"],
+                        channel=ctx["channel"],
+                        provider_id=self._provider_id,
+                        model_name=self.model,
+                    )

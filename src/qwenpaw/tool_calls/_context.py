@@ -45,6 +45,13 @@ class ToolCallContext:
     offload_reason: OffloadReason | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     governance_metadata: dict[str, Any] = field(default_factory=dict)
+    # Snapshot of the tool call's input arguments at launch time, captured so
+    # the trajectory recorder can persist what the model asked the tool to do
+    # even after the call object goes out of scope. Best-effort: None when
+    # the underlying tool_call object does not expose a dict ``input`` (rare;
+    # custom non-agentscope adapters). The recorder treats ``None`` as
+    # "unknown" and does not invent values.
+    tool_input: dict[str, Any] | None = None
 
     @property
     def is_cancelled(self) -> bool:
