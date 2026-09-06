@@ -82,6 +82,7 @@ class WorkspaceBootstrapFactory:
                 SessionLoadHook,
                 SessionSaveHook,
             )
+            from ...hooks.session.transcript_hook import TranscriptAppendHook
             from ...hooks.skill_env.skill_env_hook import (
                 SkillEnvCleanupHook,
                 SkillEnvHook,
@@ -97,6 +98,7 @@ class WorkspaceBootstrapFactory:
                 CronMemoryRestoreHook,
                 SessionLoadHook,
                 SessionSaveHook,
+                TranscriptAppendHook,
                 BootstrapHook,
                 SkillEnvHook,
                 SkillEnvCleanupHook,

@@ -1729,6 +1729,52 @@ def _sanitize_loop_config(
     running["loop"] = validated.model_dump(exclude_none=True)
 
 
+class TranscriptExportConfig(BaseModel):
+    """Append-only conversation transcript export (JSONL).
+
+    When enabled, each completed agent response appends newly observed
+    messages for the session to a local JSONL file. Disabled by default so
+    the main request path performs no extra disk I/O.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Append per-turn transcript JSONL after each response. "
+            "Off by default; no transcript disk I/O when disabled."
+        ),
+    )
+    path: str = Field(
+        default="transcripts",
+        description=(
+            "Directory relative to the agent workspace_dir where per-session "
+            "JSONL files are written."
+        ),
+    )
+    include_reasoning: bool = Field(
+        default=True,
+        description="Include model thinking / reasoning blocks.",
+    )
+    include_tool_calls: bool = Field(
+        default=True,
+        description="Include tool / plugin call messages.",
+    )
+    include_tool_results: bool = Field(
+        default=True,
+        description="Include tool / plugin call output messages.",
+    )
+    max_tool_output_chars: int = Field(
+        default=50_000,
+        ge=0,
+        description=(
+            "Truncate tool output strings longer than this many characters. "
+            "0 means no truncation."
+        ),
+    )
+
+
 class AgentsRunningConfig(BaseModel):
     """Agent runtime behavior configuration."""
 
@@ -1880,6 +1926,14 @@ class AgentsRunningConfig(BaseModel):
         description=(
             "Async chat-title generation toggle and timeout. See "
             "AutoTitleConfig."
+        ),
+    )
+
+    transcript_export: TranscriptExportConfig = Field(
+        default_factory=TranscriptExportConfig,
+        description=(
+            "Optional append-only JSONL transcript export after each "
+            "response. See TranscriptExportConfig."
         ),
     )
 
