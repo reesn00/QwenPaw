@@ -5,9 +5,11 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 import asyncio
 from dataclasses import replace
 import gzip
+import json
 from pathlib import Path
 import sqlite3
 import threading
+import time
 from urllib.parse import urlsplit
 from unittest.mock import patch
 
@@ -95,6 +97,7 @@ def _client(
     hub_config: HubConfig | None = None,
     provisioner_available: bool = True,
     runtime_port: int = 0,
+    runtime_provisioner: RuntimeProvisioner | None = None,
 ) -> TestClient:
     database = tmp_path / "control.db"
     registry = RuntimeRegistry(database)
@@ -117,15 +120,14 @@ def _client(
         )
         return environment
 
+    provisioner = runtime_provisioner or _FakeProvisioner(
+        provisioner_available,
+        runtime_port,
+    )
     service = RuntimeService(
         root_dir=tmp_path,
         registry=registry,
-        provisioners={
-            "local": _FakeProvisioner(
-                provisioner_available,
-                runtime_port,
-            ),
-        },
+        provisioners={"local": provisioner},
         credential_provider=runtime_environment,
         hub_config=hub_config,
     )
@@ -527,6 +529,77 @@ def test_unavailable_provisioner_keeps_control_plane_in_safe_mode(
         assert client.app.state.runtime_service.registry.list() == []
 
 
+def test_health_starts_runtime_once_without_blocking_control_plane(
+    tmp_path: Path,
+) -> None:
+    provisioner = _FakeProvisioner()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_start(
+        record: RuntimeRecord,
+        credentials: Mapping[str, str],
+    ) -> RuntimeRecord:
+        del credentials
+        entered.set()
+        assert release.wait(timeout=3)
+        return replace(record, state=RuntimeState.RUNNING, pid=100)
+
+    with (
+        patch.object(provisioner, "start", side_effect=slow_start) as start,
+        _client(tmp_path, runtime_provisioner=provisioner) as client,
+    ):
+        headers = _headers(_register(client, "owner"))
+
+        first = client.get("/api/hub/healthz", headers=headers)
+        assert first.status_code == 200
+        assert first.json()["runtime_state"] == "starting"
+        assert entered.wait(timeout=1)
+
+        version = client.get("/api/version")
+        second = client.get("/api/hub/healthz", headers=headers)
+
+        assert version.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["runtime_state"] == "starting"
+        assert start.call_count == 1
+
+        release.set()
+        deadline = time.monotonic() + 1
+        service = client.app.state.runtime_service
+        runtime_id = service.registry.list()[0].runtime_id
+        while service.active_operation(runtime_id):
+            if time.monotonic() >= deadline:
+                pytest.fail("Runtime start operation did not finish")
+            time.sleep(0.01)
+
+        ready = client.get("/api/hub/healthz", headers=headers)
+        assert ready.json()["runtime_state"] == "running"
+
+        event_loop_threads: list[int] = []
+        registry_read_threads: list[int] = []
+        runtime_available = service.runtime_available
+        get_runtime = service.get
+
+        def track_event_loop() -> bool:
+            event_loop_threads.append(threading.get_ident())
+            return runtime_available()
+
+        def track_registry_read(runtime_id: str) -> RuntimeRecord:
+            registry_read_threads.append(threading.get_ident())
+            return get_runtime(runtime_id)
+
+        with (
+            patch.object(service, "runtime_available", track_event_loop),
+            patch.object(service, "get", track_registry_read),
+        ):
+            checked = client.get("/api/hub/healthz", headers=headers)
+
+        assert checked.status_code == 200
+        assert registry_read_threads
+        assert event_loop_threads[0] not in registry_read_threads
+
+
 def test_runtime_ownership_and_admin_user_management(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         admin_token = _register(client, "owner")
@@ -645,6 +718,46 @@ def test_settings_apply_immediately_and_reject_stale_revision(
         assert "runtime limit reached" in blocked.json()["detail"]
         assert stale.status_code == 409
         assert "changed concurrently" in stale.json()["detail"]
+
+
+def test_settings_return_422_for_non_finite_proxy_timeout(
+    admin_client: tuple[TestClient, str],
+) -> None:
+    """Hub validation errors use the shared JSON-safe response handler."""
+    client, admin_token = admin_client
+    current = client.get(
+        "/api/hub/admin/settings",
+        headers=_headers(admin_token),
+    )
+    payload = current.json()
+    payload["config"]["control_plane"]["proxy"][
+        "request_idle_timeout_seconds"
+    ] = float("nan")
+
+    response = client.put(
+        "/api/hub/admin/settings",
+        content=json.dumps(
+            {
+                "revision": payload["revision"],
+                "config": payload["config"],
+            },
+        ),
+        headers={
+            **_headers(admin_token),
+            "content-type": "application/json",
+        },
+    )
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == [
+        "body",
+        "config",
+        "control_plane",
+        "proxy",
+        "request_idle_timeout_seconds",
+    ]
+    assert error["input"] == "NaN"
 
 
 def test_credential_api_never_returns_plaintext(tmp_path: Path) -> None:
@@ -1228,6 +1341,167 @@ def test_operations_overview_and_audit_are_real_and_sanitized(
             "credential.store",
             "runtime.create",
         }
+
+
+def test_login_attempts_are_audited_with_outcome_and_source(
+    tmp_path: Path,
+) -> None:
+    """Granted and rejected logins must both reach the audit log."""
+    with _client(tmp_path) as client:
+        token = _register(client, "owner")
+        granted = client.post(
+            "/api/auth/login",
+            json={"username": "owner", "password": "safe-password"},
+        )
+        rejected = client.post(
+            "/api/auth/login",
+            json={"username": "owner", "password": "wrong-password"},
+        )
+
+        audit = client.get(
+            "/api/hub/admin/audit?action=auth.login&page_size=10",
+            headers=_headers(token),
+        )
+        events = audit.json()["items"]
+
+        assert granted.status_code == 200
+        assert rejected.status_code == 401
+        assert audit.json()["total"] == 2
+        assert {event["outcome"] for event in events} == {
+            "failure",
+            "success",
+        }
+        failure = next(
+            event for event in events if event["outcome"] == "failure"
+        )
+        success = next(
+            event for event in events if event["outcome"] == "success"
+        )
+        assert failure["actor_username"] == "owner"
+        assert failure["remote_address"]
+        assert failure["detail"]["reason"]
+        assert success["actor_user_id"]
+        assert "wrong-password" not in audit.text
+
+
+def test_rejected_registration_is_audited(tmp_path: Path) -> None:
+    """A denied registration attempt must leave an audit trail."""
+    with _client(tmp_path) as client:
+        token = _register(client, "owner")
+        duplicate = client.post(
+            "/api/auth/register",
+            json={"username": "owner", "password": "safe-password"},
+        )
+
+        audit = client.get(
+            "/api/hub/admin/audit?action=auth.register",
+            headers=_headers(token),
+        )
+        events = audit.json()["items"]
+
+        assert duplicate.status_code in (403, 409)
+        assert audit.json()["total"] == 2
+        denied = next(
+            event for event in events if event["outcome"] == "failure"
+        )
+        assert denied["actor_username"] == "owner"
+        assert denied["detail"]["reason"]
+
+
+def test_failed_runtime_creation_is_audited(tmp_path: Path) -> None:
+    """A rejected runtime creation must be audited, not silently lost."""
+    with _client(tmp_path, provisioner_available=False) as client:
+        token = _register(client, "owner")
+        created = client.post(
+            "/api/hub/runtimes",
+            json={"runtime_id": "blocked-runtime"},
+            headers=_headers(token),
+        )
+
+        audit = client.get(
+            "/api/hub/admin/audit?action=runtime.create",
+            headers=_headers(token),
+        )
+        events = audit.json()["items"]
+
+        assert created.status_code == 503
+        assert audit.json()["total"] == 1
+        assert events[0]["outcome"] == "failure"
+        assert events[0]["resource_id"] == "blocked-runtime"
+        assert "sandbox unavailable" in events[0]["detail"]["reason"]
+
+
+def test_reserved_metadata_rejection_is_audited(tmp_path: Path) -> None:
+    """A denied backend override must be audited like other denials."""
+    with _client(tmp_path) as client:
+        token = _register(client, "owner")
+        rejected = client.post(
+            "/api/hub/runtimes",
+            json={
+                "runtime_id": "blocked",
+                "metadata": {"docker": {"image": "attacker/image"}},
+            },
+            headers=_headers(token),
+        )
+
+        audit = client.get(
+            "/api/hub/admin/audit?action=runtime.create&outcome=failure",
+            headers=_headers(token),
+        )
+        events = audit.json()["items"]
+
+        assert rejected.status_code == 400
+        assert audit.json()["total"] == 1
+        assert events[0]["resource_id"] == "blocked"
+        assert "administrator-controlled" in events[0]["detail"]["reason"]
+        assert "docker" in events[0]["detail"]["reason"]
+        assert "attacker/image" not in audit.text
+
+
+def test_audit_store_failure_never_blocks_authentication(
+    tmp_path: Path,
+) -> None:
+    """Broken telemetry must not mask the real authentication result."""
+    with _client(tmp_path) as client:
+        _register(client, "owner")
+        with patch.object(
+            client.app.state.operations,
+            "record",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            granted = client.post(
+                "/api/auth/login",
+                json={"username": "owner", "password": "safe-password"},
+            )
+            rejected = client.post(
+                "/api/auth/login",
+                json={"username": "owner", "password": "wrong-password"},
+            )
+
+        assert granted.status_code == 200
+        assert granted.json()["token"]
+        assert rejected.status_code == 401
+
+
+def test_audit_store_failure_keeps_runtime_error_status(
+    tmp_path: Path,
+) -> None:
+    """Broken telemetry must not replace the real runtime error status."""
+    with _client(tmp_path, provisioner_available=False) as client:
+        token = _register(client, "owner")
+        with patch.object(
+            client.app.state.operations,
+            "record",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            created = client.post(
+                "/api/hub/runtimes",
+                json={"runtime_id": "blocked-runtime"},
+                headers=_headers(token),
+            )
+
+        assert created.status_code == 503
+        assert "sandbox unavailable" in created.json()["detail"]
 
 
 @pytest.mark.parametrize(

@@ -82,26 +82,19 @@ def _is_scroll_memory_placeholder(msg: Msg) -> bool:
     )
 
 
-# Visual compression collapses history/context ranges into user-role
-# messages with these names. They are model-only reconstructions.
-_VISUAL_PLACEHOLDER_NAMES = frozenset(
-    {"visual_context", "visual_history"},
-)
-
-
 def _is_synthetic_user_message(msg: Msg) -> bool:
     """Return whether *msg* is a runtime-injected user-role message.
 
     Loop gates, stop handlers, and rubric evaluation append tagged
     ``role="user"`` stubs to keep a turn going; visual compression
-    collapses history into ``visual_history`` / ``visual_context``
+    collapses history into ``visual_history``
     user messages. None of them is user transcript — rendering them as
     user cards made the original instruction appear rewritten after a
     session switch.
     """
     if msg.role != "user":
         return False
-    if msg.name in _VISUAL_PLACEHOLDER_NAMES:
+    if msg.name == "visual_history":
         return True
     metadata = getattr(msg, "metadata", None)
     return (
@@ -145,10 +138,10 @@ def build_env_context(
     user_name: Optional[str] = None,
     channel: Optional[str] = None,
     working_dir: Optional[str] = None,
-    add_hint: bool = True,
     default_shell: Optional[str] = None,
     project_dir: Optional[str] = None,
     active_model_name: Optional[str] = None,
+    agent_id: Optional[str] = None,
 ) -> str:
     """
     Build environment context with current request context prepended.
@@ -160,7 +153,6 @@ def build_env_context(
             Only rendered when provided by the channel via channel_meta.
         channel: Current channel name
         working_dir: Working directory path
-        add_hint: Whether to add hint context
         default_shell: Shell executable used by execute_shell_command.
             When provided, included in the context so the LLM can
             generate syntax appropriate for that shell.
@@ -170,6 +162,7 @@ def build_env_context(
             so the LLM stops treating the workspace as home.
         active_model_name: Current active model name for runtime
             identity (e.g. "qwen-max", "gpt-4o").
+        agent_id: Current agent identifier.
 
     Returns:
         Formatted environment context string
@@ -210,19 +203,11 @@ def build_env_context(
     elif working_dir is not None:
         parts.append(f"- Working directory: {working_dir}")
 
-    if add_hint:
+    if agent_id:
         parts.append(
-            "- Important:\n"
-            "  1. Prefer using skills when completing tasks "
-            "(e.g. use the cron skill for scheduled tasks). "
-            "Consult the relevant skill documentation if unsure.\n"
-            "  2. When using write_file, if you want to avoid overwriting "
-            "existing content, use read_file first to inspect the file, "
-            "then use edit_file for partial updates or appending.\n"
-            "  3. Use tool calls to perform actions. A response without a "
-            "tool call indicates the task is complete. To continue a task, "
-            "you must generate a tool call or provide useful feedback if "
-            "you are blocked.\n",
+            f"- Agent Identity: Your agent id is "
+            f"{json.dumps(str(agent_id))}. "
+            f"This is your unique identifier in the multi-agent system.",
         )
 
     # Keep request-specific values after the reusable environment prefix.

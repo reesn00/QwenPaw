@@ -1295,10 +1295,27 @@ def _reasoning_by_assistant_segment(
     aligned: list[str | None] = []
     reasoning_parts: list[str] = []
     segment_survives = False
+    omitted_ids = {
+        str(item)
+        for item in getattr(
+            formatter,
+            "_qwenpaw_omit_thinking_ids",
+            set(),
+        )
+    }
+    if getattr(formatter, "_qwenpaw_require_reasoning_content", False):
+        # Some OpenAI-compatible providers require the exact reasoning text
+        # from every previous assistant tool-call turn. Once that capability
+        # is known, a stale request-time fold must never replace the original
+        # content with either omission or a placeholder.
+        omitted_ids.clear()
 
     for block in blocks:
         block_type = _get(block, "type")
         if block_type == "thinking":
+            block_id = _get(block, "id")
+            if block_id is not None and str(block_id) in omitted_ids:
+                continue
             thinking = _get(block, "thinking", "")
             if thinking:
                 reasoning_parts.append(thinking)
@@ -1446,10 +1463,33 @@ def _fixup_media_list(items: list) -> None:
                 _fixup_media_list(output)
 
 
+_EXACT_REASONING_REPLAY_PROVIDER_IDS = frozenset({"deepseek"})
+
+
+def _requires_exact_reasoning_replay(
+    provider_id: str | None,
+    model_id: str | None,
+) -> bool:
+    """Return the provider/model-level reasoning replay capability.
+
+    Formatter inheritance is insufficient here because many providers share
+    the OpenAI chat formatter while enforcing different tool-call protocols.
+    The model-name check also covers routed DeepSeek models served through an
+    aggregator such as OpenRouter.
+    """
+    normalized_provider_id = (provider_id or "").strip().lower()
+    normalized_model_id = (model_id or "").strip().lower()
+    return (
+        normalized_provider_id in _EXACT_REASONING_REPLAY_PROVIDER_IDS
+        or "deepseek" in normalized_model_id
+    )
+
+
 # pylint: disable-next=too-many-statements
 def _create_file_block_support_formatter(
     base_formatter_class: Type[FormatterBase],
     provider_id: str | None = None,
+    model_id: str | None = None,
 ) -> Type[FormatterBase]:
     """Create a formatter class with file block support.
 
@@ -1461,10 +1501,29 @@ def _create_file_block_support_formatter(
         provider_id: Provider owning the formatter. Provider-specific
             tool-call metadata is relayed only when this matches the
             provider that originally emitted it.
+        model_id: Model served by the provider. This is used together with
+            ``provider_id`` for request-protocol capabilities that cannot be
+            inferred from the shared formatter base class.
 
     Returns:
         Enhanced formatter class with file block support
     """
+
+    supports_reasoning_content_relay = not (
+        (
+            AnthropicChatFormatter is not None
+            and issubclass(base_formatter_class, AnthropicChatFormatter)
+        )
+        or issubclass(base_formatter_class, OpenAIResponseFormatter)
+    )
+    requires_exact_reasoning_replay = _requires_exact_reasoning_replay(
+        provider_id,
+        model_id,
+    )
+    supports_thinking_omission = (
+        supports_reasoning_content_relay
+        and not requires_exact_reasoning_replay
+    )
 
     class FileBlockSupportFormatter(base_formatter_class):
         """Formatter with file block support for tool results."""
@@ -1488,6 +1547,27 @@ def _create_file_block_support_formatter(
                     "video/*",
                 ]
             super().__init__(**kwargs)
+
+        def set_thinking_omit_ids(self, block_ids: set[str]) -> bool:
+            """Set request-time reasoning omissions when wire-compatible.
+
+            Anthropic thinking blocks are signed and must remain intact during
+            tool use. Responses formatters own their reasoning representation
+            as well. DeepSeek requires the exact reasoning content to be
+            replayed throughout a tool-call chain. A formatter that learned
+            the same requirement from a provider error must also reject this
+            extension. Unsupported formatters clear stale omission state.
+            """
+            can_omit = supports_thinking_omission and not getattr(
+                self,
+                "_qwenpaw_require_reasoning_content",
+                False,
+            )
+            accepted_ids = (
+                {str(item) for item in block_ids} if can_omit else set()
+            )
+            setattr(self, "_qwenpaw_omit_thinking_ids", accepted_ids)
+            return can_omit
 
         def _format_anthropic_data_block(self, block):
             """Route video ``DataBlock``s to our local helper; defer
@@ -1693,9 +1773,7 @@ def _create_file_block_support_formatter(
                 False,
             )
             should_inject_reasoning = has_reasoning or require_reasoning
-            formatter_supports_reasoning = (
-                not is_anthropic_formatter and not _is_response_formatter
-            )
+            formatter_supports_reasoning = supports_reasoning_content_relay
             should_relay_reasoning = relay_reasoning or require_reasoning
             if (
                 should_inject_reasoning
@@ -1759,7 +1837,9 @@ def _create_file_block_support_formatter(
                             out_msg.setdefault("reasoning_content", " ")
                 else:
                     for i, out_msg in enumerate(out_assistant):
-                        if relay_reasoning and aligned_reasoning[i]:
+                        if aligned_reasoning[i] and (
+                            relay_reasoning or require_reasoning
+                        ):
                             out_msg["reasoning_content"] = aligned_reasoning[i]
                         elif require_reasoning:
                             out_msg.setdefault("reasoning_content", " ")
@@ -1912,6 +1992,42 @@ def _resolved_provider_id(provider: Any, configured_provider_id: str) -> str:
     return str(getattr(provider, "id", "") or configured_provider_id)
 
 
+def _ensure_model_context_size(
+    model: Any,
+    provider: Any,
+    model_id: str,
+) -> None:
+    """Restore missing or defaulted windows from provider resolution."""
+    current = getattr(model, "context_size", None)
+    if isinstance(current, (int, float)) and current > 0 and current != 32768:
+        return
+    try:
+        resolved = provider.get_context_size(model_id)
+        needs_restore = not (isinstance(current, (int, float)) and current > 0)
+        defaulted_context = current == 32768 and resolved != 32768
+        if (
+            isinstance(resolved, int)
+            and resolved > 0
+            and (needs_restore or defaulted_context)
+        ):
+            setattr(model, "context_size", resolved)
+            logger.warning(
+                "Model %s:%s context_size=%r; restored %s "
+                "from Provider configuration",
+                getattr(provider, "id", "unknown"),
+                model_id,
+                current,
+                resolved,
+            )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(
+            "Unable to restore context_size for model %s:%s: %s",
+            getattr(provider, "id", "unknown"),
+            model_id,
+            exc,
+        )
+
+
 @dataclass
 class _AgentModelSettings:
     """Model routing settings loaded for one agent."""
@@ -2029,6 +2145,11 @@ def _apply_model_fallbacks(
                 fallback_model,
                 fallback_provider_id,
             )
+            _ensure_model_context_size(
+                fallback_model,
+                fallback_provider,
+                fallback_slot.model,
+            )
             _install_model_formatter(
                 fallback_model,
                 provider_id=fallback_provider_id,
@@ -2120,11 +2241,16 @@ def create_model_and_formatter(
         with agent_thinking_level(settings.thinking_level):
             model = provider.get_chat_model_instance(model_slot.model)
         provider_id = _resolved_provider_id(provider, model_slot.provider_id)
+        selected_model_id = model_slot.model
     else:
         # Fallback to global active model
-        model = ProviderManager.get_active_chat_model()
-        global_model = ProviderManager.get_instance().get_active_model()
-        if not global_model:
+        manager = ProviderManager.get_instance()
+        global_model = manager.get_active_model()
+        if (
+            global_model is None
+            or not global_model.provider_id
+            or not global_model.model
+        ):
             raise ProviderError(
                 message=(
                     "No active model configured. "
@@ -2132,14 +2258,19 @@ def create_model_and_formatter(
                     "or set an agent-specific model."
                 ),
             )
-        provider_id = _resolved_provider_id(
-            ProviderManager.get_instance().get_provider(
-                global_model.provider_id,
-            ),
-            global_model.provider_id,
-        )
+        provider = manager.get_provider(global_model.provider_id)
+        if provider is None:
+            raise ProviderError(
+                message=(
+                    f"Active provider '{global_model.provider_id}' not found."
+                ),
+            )
+        provider_id = _resolved_provider_id(provider, global_model.provider_id)
+        selected_model_id = global_model.model
+        model = provider.get_chat_model_instance(selected_model_id)
 
     provider_id = _bind_provider_id_to_model(model, provider_id)
+    _ensure_model_context_size(model, provider, selected_model_id)
 
     # Create the formatter based on the model's native one.  In 2.0 every
     # ``ChatModelBase`` carries its own ``self.formatter`` (set by its
@@ -2235,6 +2366,7 @@ def _create_formatter_instance(
     formatter_class = _create_file_block_support_formatter(
         base_formatter_class,
         provider_id=provider_id,
+        model_id=str(getattr(model, "model", "") or ""),
     )
     # Carry over all Pydantic field values (max_bytes,
     # relay_reasoning_content, etc.) from the provider-constructed
