@@ -29,7 +29,7 @@ async def service(tmp_path: Path):
         tmp_path,
         config=TrajectoryConfig(enabled=True),
     )
-    svc.start()
+    await svc.start()
     yield svc
 
 
