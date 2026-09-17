@@ -255,10 +255,11 @@ async def test_records_response_content_from_blocks(
     Verifies the contract spelled out in DESIGN.md §8.5:
 
     * ``model_response.payload.content`` carries the ordered block list
-      (``ThinkingBlock`` + ``TextBlock`` + ``ToolCallBlock``).
+      (``ThinkingBlock`` + ``TextBlock`` + ``ToolCallBlock``) — the
+      single source of truth for reasoning chain.
     * ``model_response.payload.finished_reason`` uses the 2.0 spelling.
-    * A separate ``THINKING`` event is written so consumers that key
-      off the typed event still get the reasoning chain.
+    * No typed ``THINKING`` event is written (would be redundant with
+      ``content[type=thinking]``).
     * A separate ``TOOL_CALL_REQUEST`` event is written with the
       OpenAI-compatible shape (``id`` / ``function.name`` /
       ``function.arguments`` string).
@@ -331,11 +332,9 @@ async def test_records_response_content_from_blocks(
     assert resp_event["payload"]["usage"]["output_tokens"] == 20
     assert resp_event["payload"]["finished_reason"] == "completed"
 
-    thinking_events = [e for e in events if e["event_type"] == "thinking"]
-    assert len(thinking_events) == 1
-    assert thinking_events[0]["payload"]["thinking"] == "let me reason..."
-    # THINKING is parented on MODEL_RESPONSE, not MODEL_REQUEST
-    assert thinking_events[0]["parent_span_id"] == resp_event["span_id"]
+    # No typed THINKING event — reasoning must surface only via
+    # ``model_response.payload.content[type=thinking]`` (DESIGN §8.5 row 1).
+    assert "thinking" not in [e["event_type"] for e in events]
 
     tc_events = [e for e in events if e["event_type"] == "tool_call_request"]
     assert len(tc_events) == 1

@@ -60,10 +60,12 @@ QwenPaw 的 agent 在一次 turn 内会触发模型请求、工具调用、流�
 ```python
 TURN_START       = "turn_start"        # turn 入口，标注 provider/model/agent_backend
 MODEL_REQUEST    = "model_request"     # 发往 LLM 的请求（messages/tools/schema 等）
-MODEL_RESPONSE   = "model_response"    # LLM 响应（含 usage）
+MODEL_RESPONSE   = "model_response"    # LLM 响应（含 usage + 完整 content blocks）
 TOOL_CALL_REQUEST = "tool_call_request" # 模型要求调工具（tool_calls + arguments）
 TOOL_EXECUTION   = "tool_execution"    # 实际执行工具的入参与结果
-THINKING         = "thinking"          # 思考内容（如启用）
+# NOTE: 历史上曾有 typed THINKING 事件；2026-09 删除 —— 它与
+# model_response.payload.content[type=thinking] 内容完全重复，
+# 单源足以覆盖回放/训练/排错。旧 .jsonl 中的 "thinking" 字符串保留兼容。
 ERROR            = "error"             # 阶段异常
 CANCEL           = "cancel"            # 用户取消
 FINAL_REPLY      = "final_reply"       # 最终发送给用户的内容
@@ -182,7 +184,7 @@ agent_config.running.trajectory_config  >  QWENPAW_TRAJECTORY_*  >  内置默认
 
 | 维度 | 必须具备 | 写入方 | 缺失后果 |
 |---|---|---|---|
-| **完整推理链（CoT 核心）** | 每个 turn 的 `THINKING` 事件 + `model_response.payload.content` 中保留 `ThinkingBlock`（2.0 blocks 结构） | [model_wrapper._extract_thinking](src/qwenpaw/token_usage/model_wrapper.py#L144)（2.0 从 content 块读，1.x 走 fallback） | 推理发散 / 死循环无法定位；只能从 history 间接 join 重建 |
+| **完整推理链（CoT 核心）** | 仅 `model_response.payload.content` 中保留 `ThinkingBlock`（2.0 blocks 结构）；1.x 走 `reasoning_content` / `extra_content` fallback，同一事件内承载 | [_response_payload](src/qwenpaw/token_usage/model_wrapper.py#L108)（content 块直接列表化） | 推理发散 / 死循环无法定位；只能从 history 间接 join 重建 |
 | **工具定义** | `model_request.payload.tools`（含 messages / tools / tool_choice / response_schema） | [model_wrapper._structured_output_payload](src/qwenpaw/token_usage/model_wrapper.py#L64) / [_request_payload](src/qwenpaw/token_usage/model_wrapper.py#L31) | 看不到模型当时可见的工具集；不同轮工具集变更不可追溯 |
 | **工具调用闭环** | `tool_call_request`（parent = `model_response`）→ `tool_execution`（按 `tool_call_id` 关联）→ `final_reply` 中对应的 `plugin_call_output` 块 | [model_wrapper](src/qwenpaw/token_usage/model_wrapper.py#L395) + [_coordinator](src/qwenpaw/tool_calls/_coordinator.py#L30) + [envelope](src/qwenpaw/runtime/envelope.py#L29) | 无法验证"模型要调 → 真调了 → 结果回到对话"的一致性 |
 | **完整任务终态** | `final_reply.metadata.status` / `error` / `usage` | [envelope._finalize_response](src/qwenpaw/runtime/envelope.py#L914) | 无法区分 `completed` / `failed` / `cancelled`；终态失败原因不可定位 |

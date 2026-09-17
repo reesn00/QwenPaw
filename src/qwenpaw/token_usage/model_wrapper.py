@@ -207,41 +207,6 @@ def _extract_tool_calls(response: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _extract_thinking(response: Any) -> str | None:
-    """Extract reasoning/thinking content from a response object.
-
-    agentscope 2.0 carries thinking in ``ThinkingBlock.thinking``
-    inside ``response.content``; older shapes exposed
-    ``response.reasoning_content`` or nested ``extra_content``.  Both
-    paths must work — the ``THINKING`` event is the typed shortcut, the
-    full ``ThinkingBlock`` is also preserved in ``_response_payload``
-    under ``content`` so the reasoning chain survives even if a consumer
-    reads only ``MODEL_RESPONSE``.
-    """
-    content = safe_attr(response, "content")
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            block_type = safe_attr(block, "type")
-            if isinstance(block_type, str) and block_type == "thinking":
-                t = safe_attr(block, "thinking")
-                if isinstance(t, str):
-                    parts.append(t)
-        if parts:
-            return "".join(parts)
-    # 1.x fallback (and the rare adapter that still puts reasoning in
-    # ``extra_content``).
-    reasoning = safe_attr(response, "reasoning_content")
-    if reasoning:
-        return str(reasoning)
-    extra = safe_attr(response, "extra_content")
-    if isinstance(extra, dict):
-        reasoning = extra.get("reasoning_content") or extra.get("thinking")
-        if reasoning:
-            return str(reasoning)
-    return None
-
-
 def _trajectory_context() -> dict[str, Any]:
     """Collect context vars for a trajectory event."""
     try:
@@ -613,20 +578,13 @@ class TokenRecordingModelWrapper(ChatModelBase):
                 provider_id=self._provider_id,
                 model_name=self.model,
             )
-        thinking = _extract_thinking(response)
-        if thinking:
-            recorder.record(
-                trace_id=ctx["trace_id"],
-                event_type=TrajectoryEventType.THINKING,
-                parent_span_id=response_event.span_id if response_event else None,
-                payload={"thinking": thinking},
-                session_id=ctx["session_id"],
-                agent_id=ctx["agent_id"],
-                user_id=ctx["user_id"],
-                channel=ctx["channel"],
-                provider_id=self._provider_id,
-                model_name=self.model,
-            )
+        # NOTE: reasoning/thinking content is no longer written as a
+        # separate typed event.  ``_response_payload`` already preserves
+        # the full ``ThinkingBlock`` (agentscope 2.0) or
+        # ``response.reasoning_content`` (1.x fallback) inside
+        # ``model_response.payload.content``, so a typed shortcut would
+        # just duplicate the bytes, double the sanitize cost, and burn
+        # ``max_record_bytes`` quota twice.
 
     async def _wrap_stream(
         self,

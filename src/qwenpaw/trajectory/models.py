@@ -20,7 +20,11 @@ class TrajectoryEventType(str, Enum):
     MODEL_RESPONSE = "model_response"
     TOOL_CALL_REQUEST = "tool_call_request"
     TOOL_EXECUTION = "tool_execution"
-    THINKING = "thinking"
+    # NOTE: a typed ``THINKING`` event used to live here.  It carried the
+    # same content already preserved in ``model_response.payload.content``
+    # under ``ThinkingBlock``, so it was redundant — readers always go
+    # through ``model_response`` to keep reasoning chain, tool call order,
+    # and token usage in a single event.  Removed: 2026-09.
     ERROR = "error"
     CANCEL = "cancel"
     FINAL_REPLY = "final_reply"
