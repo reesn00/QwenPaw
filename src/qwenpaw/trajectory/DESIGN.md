@@ -174,6 +174,24 @@ agent_config.running.trajectory_config  >  QWENPAW_TRAJECTORY_*  >  内置默认
 
 所有集成点都通过 `get_trajectory_service(agent_id)` 拿服务，`None` 时直接返回。`agent_id` 来自 `agent_context.set_current_agent_id()` 上下文变量。
 
+各事件写入的内容契约见 §8.5 **事件内容必须具备项**。
+
+## 8.5 事件内容必须具备项
+
+回放、排错、训练下游消费对轨迹的最低要求。任一必备项缺失即视为"不完整"。所有内容在 [sanitize_payload](src/qwenpaw/trajectory/models.py#L201) 阶段经过脱敏 + 截断（`[redacted]` / `...[truncated]`），因此敏感字段会自动保护、单事件体量被 `max_record_bytes` 兜底。
+
+| 维度 | 必须具备 | 写入方 | 缺失后果 |
+|---|---|---|---|
+| **完整推理链（CoT 核心）** | 每个 turn 的 `THINKING` 事件 + `model_response.payload.content` 中保留 `ThinkingBlock`（2.0 blocks 结构） | [model_wrapper._extract_thinking](src/qwenpaw/token_usage/model_wrapper.py#L144)（2.0 从 content 块读，1.x 走 fallback） | 推理发散 / 死循环无法定位；只能从 history 间接 join 重建 |
+| **工具定义** | `model_request.payload.tools`（含 messages / tools / tool_choice / response_schema） | [model_wrapper._structured_output_payload](src/qwenpaw/token_usage/model_wrapper.py#L64) / [_request_payload](src/qwenpaw/token_usage/model_wrapper.py#L31) | 看不到模型当时可见的工具集；不同轮工具集变更不可追溯 |
+| **工具调用闭环** | `tool_call_request`（parent = `model_response`）→ `tool_execution`（按 `tool_call_id` 关联）→ `final_reply` 中对应的 `plugin_call_output` 块 | [model_wrapper](src/qwenpaw/token_usage/model_wrapper.py#L395) + [_coordinator](src/qwenpaw/tool_calls/_coordinator.py#L30) + [envelope](src/qwenpaw/runtime/envelope.py#L29) | 无法验证"模型要调 → 真调了 → 结果回到对话"的一致性 |
+| **完整任务终态** | `final_reply.metadata.status` / `error` / `usage` | [envelope._finalize_response](src/qwenpaw/runtime/envelope.py#L914) | 无法区分 `completed` / `failed` / `cancelled`；终态失败原因不可定位 |
+| **model_response 完整内容** | `payload = {content: [...blocks], usage, finished_reason}`（2.0 blocks；1.x fallback 到 `text` / `tool_calls` / `finish_reason`）；流式由 `ChatModelBase.__call__` 基类保证最后一个 `is_last=True` chunk 为完整累积结果（见 [`_StreamAccumulator.build`](https://github.com/agentscope-ai/agentscope/blob/main/src/agentscope/model/_utils.py)） | [model_wrapper._response_payload](src/qwenpaw/token_usage/model_wrapper.py#L120) | 最后一轮无"下一轮"间接记录，**单点依赖 final_reply 归档成功**（历史上 archiver terminal-wait bug 曾打在这） |
+| **tool_execution.input 已解析** | `payload.input` 为 dict（从 `ToolCallBlock.input` 的 JSON 字符串解析；解析失败或非 dict → 显式 `None`） | [tool_calls._parse_tool_input](src/qwenpaw/tool_calls/_coordinator.py#L1117) | 事件不自包含；每次分析都要跨事件 join 工具调用侧 |
+| **call / result 顺序一致** | 同 session 内所有事件 `timestamp` 严格单调；同一 turn 内不重复 | `TrajectoryEvent.timestamp` 默认 ISO-8601 UTC（构造时填充）；buffer `enqueue` 不重排 | 跨事件 join 失去因果；排查竞态 / 乱序不可行 |
+
+测试侧：`tests/unit/trajectory/test_model_wrapper.py` 的 `FakeChatModel` 改用真实 `ChatResponse` + blocks 验证新路径；`test_tool_hooks.py` 增加 `input=json.dumps(...)` 字符串用例与解析失败用例。
+
 ## 9. 全局注册表
 
 ```python

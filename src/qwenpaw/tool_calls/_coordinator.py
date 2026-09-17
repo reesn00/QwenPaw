@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -1115,12 +1116,54 @@ class ToolCoordinator:
 
 
 def _parse_tool_input(tool_call: Any) -> dict[str, Any]:
+    """Parse a tool call's input arguments into a JSON-safe dict.
+
+    agentscope 2.0 stores the raw JSON argument string on
+    ``ToolCallBlock.input``; older shapes (and some custom adapters)
+    keep a dict. ``{}`` on missing or malformed input so callers can
+    still construct a context — the trajectory recorder translates an
+    empty dict into an explicit ``None`` payload (via ``... or None``
+    at the call site) to signal "unknown" rather than silently
+    substituting placeholders.
+    """
     raw = getattr(tool_call, "input", None)
+    if raw is None or raw == "":
+        return {}
     if isinstance(raw, dict):
         return dict(raw)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
     return {}
 
 
 def _update_tool_input(tool_call: Any, modified: dict[str, Any]) -> None:
-    if hasattr(tool_call, "input") and isinstance(tool_call.input, dict):
-        tool_call.input.update(modified)
+    """Write *modified* back into ``tool_call.input``.
+
+    agentscope 2.0 stores ``ToolCallBlock.input`` as a JSON string, so
+    we have to re-serialize; dict-shaped inputs (legacy / custom
+    adapters) are updated in place. No-op when *modified* is empty or
+    the tool call has no writable ``input`` attribute.
+    """
+    if not modified or not hasattr(tool_call, "input"):
+        return
+    raw = getattr(tool_call, "input", None)
+    if isinstance(raw, dict):
+        raw.update(modified)
+        return
+    if isinstance(raw, str):
+        try:
+            current = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        current.update(modified)
+        tool_call.input = json.dumps(current, ensure_ascii=False)
+        return
+    if raw is None:
+        tool_call.input = json.dumps(modified, ensure_ascii=False)

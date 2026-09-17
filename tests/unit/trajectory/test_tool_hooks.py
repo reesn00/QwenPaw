@@ -160,3 +160,103 @@ async def test_records_tool_input_none_when_missing(
     events = [json.loads(line) for line in lines]
     tool_event = next(e for e in events if e["event_type"] == "tool_execution")
     assert tool_event["payload"]["input"] is None
+
+
+@pytest.mark.asyncio
+async def test_records_tool_input_from_json_string(
+    service: TrajectoryService,
+    tmp_path: Path,
+):
+    """agentscope 2.0 ``ToolCallBlock.input`` is a JSON string — parsed to dict.
+
+    Closes the gap surfaced in functional review where the trajectory
+    always recorded ``input=None`` because the parser required a dict.
+    """
+    register_trajectory_service("agent-tool-json", service)
+    set_current_agent_id("agent-tool-json")
+    set_current_session_id("session-tool-json")
+    set_current_trace_id("trace-tool-json")
+
+    coordinator = ToolCoordinator()
+
+    async def handler(tool_call):
+        yield ToolResponse(
+            content=[TextBlock(type="text", text="ok")],
+            id=tool_call.id,
+        )
+
+    tool_call = SimpleNamespace(
+        id="tc-json",
+        name="web_search",
+        input='{"search_term": "hello world", "limit": 5}',
+    )
+    async for _ in coordinator.execute(
+        tool_call=tool_call,
+        next_handler=handler,
+        session_id="session-tool-json",
+        agent_id="agent-tool-json",
+        root_session_id="session-tool-json",
+    ):
+        pass
+
+    await service.stop()
+    lines = (
+        (tmp_path / "trajectory" / "session-tool-json.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .split("\n")
+    )
+    events = [json.loads(line) for line in lines]
+    tool_event = next(e for e in events if e["event_type"] == "tool_execution")
+    assert tool_event["payload"]["input"] == {
+        "search_term": "hello world",
+        "limit": 5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_records_tool_input_none_when_malformed_json(
+    service: TrajectoryService,
+    tmp_path: Path,
+):
+    """Malformed JSON string input is recorded as ``None``, not silently swallowed."""
+    register_trajectory_service("agent-tool-bad", service)
+    set_current_agent_id("agent-tool-bad")
+    set_current_session_id("session-tool-bad")
+    set_current_trace_id("trace-tool-bad")
+
+    coordinator = ToolCoordinator()
+
+    async def handler(tool_call):
+        yield ToolResponse(
+            content=[TextBlock(type="text", text="ok")],
+            id=tool_call.id,
+        )
+
+    tool_call = SimpleNamespace(
+        id="tc-bad",
+        name="web_search",
+        input="{not valid json",
+    )
+    async for _ in coordinator.execute(
+        tool_call=tool_call,
+        next_handler=handler,
+        session_id="session-tool-bad",
+        agent_id="agent-tool-bad",
+        root_session_id="session-tool-bad",
+    ):
+        pass
+
+    await service.stop()
+    lines = (
+        (tmp_path / "trajectory" / "session-tool-bad.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .split("\n")
+    )
+    events = [json.loads(line) for line in lines]
+    tool_event = next(e for e in events if e["event_type"] == "tool_execution")
+    # Unknown input must surface as an explicit None so consumers can
+    # distinguish "no argument capture" from "argument was an empty
+    # dict" — the latter would render as ``{}`` after JSON round-trip.
+    assert tool_event["payload"]["input"] is None

@@ -243,3 +243,110 @@ async def test_structured_output_records_normalized_request(
     assert request_event["payload"]["response_schema"] == {"type": "object"}
     # No opaque ``args`` blob anymore for the canonical kwargs path
     assert "args" not in request_event["payload"]
+
+
+@pytest.mark.asyncio
+async def test_records_response_content_from_blocks(
+    service: TrajectoryService,
+    tmp_path: Path,
+):
+    """agentscope 2.0 blocks structure: model_response preserves full content.
+
+    Verifies the contract spelled out in DESIGN.md §8.5:
+
+    * ``model_response.payload.content`` carries the ordered block list
+      (``ThinkingBlock`` + ``TextBlock`` + ``ToolCallBlock``).
+    * ``model_response.payload.finished_reason`` uses the 2.0 spelling.
+    * A separate ``THINKING`` event is written so consumers that key
+      off the typed event still get the reasoning chain.
+    * A separate ``TOOL_CALL_REQUEST`` event is written with the
+      OpenAI-compatible shape (``id`` / ``function.name`` /
+      ``function.arguments`` string).
+    """
+    from agentscope.message import (
+        TextBlock,
+        ThinkingBlock,
+        ToolCallBlock,
+    )
+    from agentscope.model._model_response import (
+        ChatResponse,
+        FinishedReason,
+    )
+    from agentscope.model._model_usage import ChatUsage
+
+    register_trajectory_service("agent-blocks", service)
+    set_current_agent_id("agent-blocks")
+    set_current_session_id("session-blocks")
+    set_current_trace_id("trace-blocks")
+
+    response = ChatResponse(
+        content=[
+            ThinkingBlock(type="thinking", thinking="let me reason..."),
+            TextBlock(type="text", text="the answer is 42"),
+            ToolCallBlock(
+                id="tc-blocks",
+                name="read_file",
+                input='{"path": "/tmp/x"}',
+            ),
+        ],
+        is_last=True,
+        usage=ChatUsage(
+            input_tokens=10,
+            output_tokens=20,
+            time=0.5,
+        ),
+        finished_reason=FinishedReason.COMPLETED,
+    )
+    fake = FakeChatModel(response)
+    wrapper = TokenRecordingModelWrapper("provider-1", fake)
+
+    await wrapper(messages=[{"role": "user", "content": "q"}])
+    await service.stop()
+
+    events = [
+        json.loads(line)
+        for line in (
+            (tmp_path / "trajectory" / "session-blocks.jsonl")
+            .read_text(encoding="utf-8")
+            .strip()
+            .split("\n")
+        )
+    ]
+
+    resp_event = next(e for e in events if e["event_type"] == "model_response")
+    content_blocks = resp_event["payload"]["content"]
+    assert isinstance(content_blocks, list)
+    block_types = [b.get("type") for b in content_blocks]
+    assert block_types == ["thinking", "text", "tool_call"]
+    # Full text/thinking content preserved (no truncation expected here)
+    thinking_block = next(b for b in content_blocks if b["type"] == "thinking")
+    text_block = next(b for b in content_blocks if b["type"] == "text")
+    tool_block = next(b for b in content_blocks if b["type"] == "tool_call")
+    assert thinking_block["thinking"] == "let me reason..."
+    assert text_block["text"] == "the answer is 42"
+    assert tool_block["name"] == "read_file"
+    assert tool_block["input"] == '{"path": "/tmp/x"}'
+    # Usage + 2.0 finished_reason spelling
+    assert resp_event["payload"]["usage"]["input_tokens"] == 10
+    assert resp_event["payload"]["usage"]["output_tokens"] == 20
+    assert resp_event["payload"]["finished_reason"] == "completed"
+
+    thinking_events = [e for e in events if e["event_type"] == "thinking"]
+    assert len(thinking_events) == 1
+    assert thinking_events[0]["payload"]["thinking"] == "let me reason..."
+    # THINKING is parented on MODEL_RESPONSE, not MODEL_REQUEST
+    assert thinking_events[0]["parent_span_id"] == resp_event["span_id"]
+
+    tc_events = [e for e in events if e["event_type"] == "tool_call_request"]
+    assert len(tc_events) == 1
+    assert tc_events[0]["payload"]["tool_calls"][0]["id"] == "tc-blocks"
+    assert (
+        tc_events[0]["payload"]["tool_calls"][0]["function"]["name"]
+        == "read_file"
+    )
+    # Arguments are kept as a JSON string — OpenAI-compatible shape.
+    assert (
+        tc_events[0]["payload"]["tool_calls"][0]["function"]["arguments"]
+        == '{"path": "/tmp/x"}'
+    )
+    assert tc_events[0]["parent_span_id"] == resp_event["span_id"]

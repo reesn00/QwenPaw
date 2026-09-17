@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Model wrapper that records token usage from LLM responses."""
 
+import json
 import time
 from datetime import date, datetime, timezone
 from typing import Any, AsyncGenerator, Literal
@@ -118,14 +119,35 @@ def _structured_output_payload(
 
 
 def _response_payload(response: Any) -> dict[str, Any]:
-    """Build a serializable response payload."""
+    """Build a serializable response payload.
+
+    agentscope 2.0 returns ``ChatResponse.content`` as a list of typed
+    blocks (``TextBlock`` / ``ThinkingBlock`` / ``ToolCallBlock`` /
+    ``DataBlock``); blocks are pydantic ``BaseModel`` so
+    ``sanitize_payload._make_json_safe`` recursively ``model_dump``s
+    them downstream.  We keep the 1.x scalar fallback (``text`` /
+    ``tool_calls`` / ``finish_reason``) so custom adapters and test
+    doubles that still expose the old shape keep working.
+    """
     payload: dict[str, Any] = {}
-    text = safe_attr(response, "text")
-    if text is not None:
-        payload["text"] = text
-    tool_calls = safe_attr(response, "tool_calls")
-    if tool_calls is not None:
-        payload["tool_calls"] = tool_calls
+
+    content = safe_attr(response, "content")
+    if isinstance(content, list):
+        # Preserve the full ordered block list so downstream consumers
+        # can rebuild the round exactly.  ``sanitize_payload`` handles
+        # pydantic ``BaseModel`` blocks and truncates per
+        # ``max_record_bytes``.
+        payload["content"] = list(content)
+    else:
+        # agentscope 1.x (and a handful of legacy test doubles): scalar
+        # fields on the response itself.
+        text = safe_attr(response, "text")
+        if isinstance(text, str):
+            payload["text"] = text
+        legacy_tcs = safe_attr(response, "tool_calls")
+        if isinstance(legacy_tcs, list):
+            payload["tool_calls"] = legacy_tcs
+
     usage = safe_attr(response, "usage")
     if usage is not None:
         try:
@@ -135,18 +157,83 @@ def _response_payload(response: Any) -> dict[str, Any]:
                 payload["usage"] = dict(usage)
             except Exception:
                 payload["usage"] = str(usage)
-    finish_reason = safe_attr(response, "finish_reason")
-    if finish_reason is not None:
-        payload["finish_reason"] = finish_reason
+
+    # 2.0 spells it ``finished_reason``; 1.x used ``finish_reason``.
+    finished_reason = safe_attr(response, "finished_reason")
+    if finished_reason is None:
+        finished_reason = safe_attr(response, "finish_reason")
+    if finished_reason is not None:
+        payload["finished_reason"] = str(finished_reason)
+
     return payload
 
 
+def _extract_tool_calls(response: Any) -> list[dict[str, Any]]:
+    """Normalize tool calls from blocks (2.0) or legacy list (1.x).
+
+    The 2.0 ``ToolCallBlock`` stores the raw JSON argument string on
+    ``input``; the 1.x shape exposed ``response.tool_calls`` directly.
+    Both are normalized here so the ``TOOL_CALL_REQUEST`` event stays
+    consumer-friendly (OpenAI-compatible ``function.arguments`` string).
+    """
+    content = safe_attr(response, "content")
+    if isinstance(content, list):
+        out: list[dict[str, Any]] = []
+        for block in content:
+            block_type = safe_attr(block, "type")
+            if isinstance(block_type, str) and block_type == "tool_call":
+                tc_id = safe_attr(block, "id")
+                tc_name = safe_attr(block, "name")
+                tc_input = safe_attr(block, "input")
+                if isinstance(tc_input, str):
+                    arguments: str | None = tc_input
+                elif isinstance(tc_input, dict):
+                    arguments = json.dumps(tc_input, ensure_ascii=False)
+                else:
+                    arguments = None
+                out.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc_name,
+                        "arguments": arguments,
+                    },
+                })
+        if out:
+            return out
+    legacy = safe_attr(response, "tool_calls")
+    if isinstance(legacy, list):
+        return list(legacy)
+    return []
+
+
 def _extract_thinking(response: Any) -> str | None:
-    """Extract reasoning/thinking content from a response object."""
+    """Extract reasoning/thinking content from a response object.
+
+    agentscope 2.0 carries thinking in ``ThinkingBlock.thinking``
+    inside ``response.content``; older shapes exposed
+    ``response.reasoning_content`` or nested ``extra_content``.  Both
+    paths must work — the ``THINKING`` event is the typed shortcut, the
+    full ``ThinkingBlock`` is also preserved in ``_response_payload``
+    under ``content`` so the reasoning chain survives even if a consumer
+    reads only ``MODEL_RESPONSE``.
+    """
+    content = safe_attr(response, "content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            block_type = safe_attr(block, "type")
+            if isinstance(block_type, str) and block_type == "thinking":
+                t = safe_attr(block, "thinking")
+                if isinstance(t, str):
+                    parts.append(t)
+        if parts:
+            return "".join(parts)
+    # 1.x fallback (and the rare adapter that still puts reasoning in
+    # ``extra_content``).
     reasoning = safe_attr(response, "reasoning_content")
     if reasoning:
         return str(reasoning)
-    # Some adapters place thinking in extra_content or text.
     extra = safe_attr(response, "extra_content")
     if isinstance(extra, dict):
         reasoning = extra.get("reasoning_content") or extra.get("thinking")
@@ -512,7 +599,7 @@ class TokenRecordingModelWrapper(ChatModelBase):
             provider_id=self._provider_id,
             model_name=self.model,
         )
-        tool_calls = safe_attr(response, "tool_calls")
+        tool_calls = _extract_tool_calls(response)
         if tool_calls:
             recorder.record(
                 trace_id=ctx["trace_id"],
@@ -548,57 +635,29 @@ class TokenRecordingModelWrapper(ChatModelBase):
         request_duration_ms: int = 0,
     ) -> AsyncGenerator[ChatResponse, None]:
         last_usage: ChatUsage | None = None
-        text_chunks: list[str] = []
-        reasoning_chunks: list[str] = []
-        tool_calls_seen: list[Any] = []
+        last_chunk: Any = None
         recorder = _get_trajectory_recorder()
         try:
             async for chunk in stream:
                 usage = safe_attr(chunk, "usage")
                 if usage is not None:
                     last_usage = usage
-                text = safe_attr(chunk, "text")
-                if text:
-                    text_chunks.append(str(text))
-                reasoning = _extract_thinking(chunk)
-                if reasoning:
-                    reasoning_chunks.append(reasoning)
-                tc = safe_attr(chunk, "tool_calls")
-                if tc:
-                    tool_calls_seen.extend(tc)
+                # agentscope 2.0 ``ChatModelBase.__call__`` wraps every
+                # provider's stream with ``_StreamAccumulator``: the stream
+                # always ends with a final ``is_last=True`` chunk that
+                # already carries the fully accumulated content (text +
+                # thinking + tool calls + finished_reason). Track it so we
+                # record one complete ``MODEL_RESPONSE`` per round instead
+                # of stitching partial chunks ourselves.
+                last_chunk = chunk
                 yield chunk
         finally:
             await stream.aclose()
             self._record_usage(last_usage)
-            if recorder is not None:
-                ctx = _trajectory_context()
-                # Reconstruct a minimal response object for payload extraction.
-                pseudo_response: Any = type("PseudoResponse", (), {})()
-                if text_chunks:
-                    pseudo_response.text = "".join(text_chunks)
-                if tool_calls_seen:
-                    pseudo_response.tool_calls = tool_calls_seen
-                if last_usage is not None:
-                    pseudo_response.usage = last_usage
+            if recorder is not None and last_chunk is not None:
                 self._record_model_response(
                     recorder,
-                    pseudo_response,
+                    last_chunk,
                     request_span_id,
                     request_duration_ms,
                 )
-                if reasoning_chunks:
-                    from ..trajectory.models import TrajectoryEventType
-
-                    thinking_text = "\n".join(reasoning_chunks)
-                    recorder.record(
-                        trace_id=ctx["trace_id"],
-                        event_type=TrajectoryEventType.THINKING,
-                        parent_span_id=request_span_id,
-                        payload={"thinking": thinking_text},
-                        session_id=ctx["session_id"],
-                        agent_id=ctx["agent_id"],
-                        user_id=ctx["user_id"],
-                        channel=ctx["channel"],
-                        provider_id=self._provider_id,
-                        model_name=self.model,
-                    )
